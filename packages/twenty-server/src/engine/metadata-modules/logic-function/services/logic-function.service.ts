@@ -1,11 +1,17 @@
 import { Injectable } from '@nestjs/common';
 
-import { FileFolder } from 'twenty-shared/types';
+import { promises as fs } from 'fs';
+import { dirname, join } from 'path';
+
+import { isObject } from '@sniptt/guards';
+import { FileFolder, type Sources } from 'twenty-shared/types';
 import { isDefined } from 'twenty-shared/utils';
 
 import { ApplicationService } from 'src/engine/core-modules/application/services/application.service';
 import { FileStorageService } from 'src/engine/core-modules/file-storage/file-storage.service';
+import { LogicFunctionBuildService } from 'src/engine/core-modules/logic-function/logic-function-build/services/logic-function-build.service';
 import { getLogicFunctionBaseFolderPath } from 'src/engine/core-modules/logic-function/logic-function-build/utils/get-logic-function-base-folder-path.util';
+import { LambdaBuildDirectoryManager } from 'src/engine/core-modules/logic-function/logic-function-drivers/utils/lambda-build-directory-manager';
 import { LogicFunctionLayerService } from 'src/engine/core-modules/logic-function/logic-function-layer/services/logic-function-layer.service';
 import { WorkspaceManyOrAllFlatEntityMapsCacheService } from 'src/engine/metadata-modules/flat-entity/services/workspace-many-or-all-flat-entity-maps-cache.service';
 import { findFlatEntityByIdInFlatEntityMapsOrThrow } from 'src/engine/metadata-modules/flat-entity/utils/find-flat-entity-by-id-in-flat-entity-maps-or-throw.util';
@@ -19,6 +25,7 @@ import { FlatLogicFunction } from 'src/engine/metadata-modules/logic-function/ty
 import { findFlatLogicFunctionOrThrow } from 'src/engine/metadata-modules/logic-function/utils/find-flat-logic-function-or-throw.util';
 import { fromCreateLogicFunctionInputToFlatLogicFunction } from 'src/engine/metadata-modules/logic-function/utils/from-create-logic-function-input-to-flat-logic-function.util';
 import { fromUpdateLogicFunctionInputToFlatLogicFunctionToUpdateOrThrow } from 'src/engine/metadata-modules/logic-function/utils/from-update-logic-function-input-to-flat-logic-function-to-update-or-throw.util';
+import { logicFunctionCreateHash } from 'src/engine/metadata-modules/logic-function/utils/logic-function-create-hash.utils';
 import { WorkspaceCacheService } from 'src/engine/workspace-cache/services/workspace-cache.service';
 import { WorkspaceMigrationBuilderException } from 'src/engine/workspace-manager/workspace-migration/exceptions/workspace-migration-builder-exception';
 import { WorkspaceMigrationValidateBuildAndRunService } from 'src/engine/workspace-manager/workspace-migration/services/workspace-migration-validate-build-and-run-service';
@@ -32,6 +39,7 @@ export class LogicFunctionService {
     private readonly logicFunctionLayerService: LogicFunctionLayerService,
     private readonly workspaceCacheService: WorkspaceCacheService,
     private readonly fileStorageService: FileStorageService,
+    private readonly logicFunctionBuildService: LogicFunctionBuildService,
   ) {}
 
   async createOne({
@@ -339,5 +347,97 @@ export class LogicFunctionService {
     });
 
     return newFlatLogicFunction;
+  }
+
+  async uploadSourceCode({
+    id,
+    code,
+    workspaceId,
+  }: {
+    id: string;
+    code: Sources;
+    workspaceId: string;
+  }): Promise<{ checksum: string; success: boolean }> {
+    const { flatLogicFunctionMaps, flatApplicationMaps } =
+      await this.workspaceCacheService.getOrRecompute(workspaceId, [
+        'flatLogicFunctionMaps',
+        'flatApplicationMaps',
+      ]);
+
+    const flatLogicFunction = findFlatLogicFunctionOrThrow({
+      id,
+      flatLogicFunctionMaps,
+    });
+
+    const applicationUniversalIdentifier = isDefined(
+      flatLogicFunction.applicationId,
+    )
+      ? flatApplicationMaps.byId[flatLogicFunction.applicationId]
+          ?.universalIdentifier
+      : undefined;
+
+    if (!isDefined(applicationUniversalIdentifier)) {
+      throw new LogicFunctionException(
+        `Application universal identifier not found for logic function ${id}`,
+        LogicFunctionExceptionCode.LOGIC_FUNCTION_NOT_FOUND,
+      );
+    }
+
+    // Compute checksum from the code
+    const checksum = logicFunctionCreateHash(JSON.stringify(code));
+
+    // Upload source files to storage
+    const lambdaBuildDirectoryManager = new LambdaBuildDirectoryManager();
+
+    try {
+      const { sourceTemporaryDir } = await lambdaBuildDirectoryManager.init();
+
+      await this.writeSourcesToLocalFolder(code, sourceTemporaryDir);
+
+      const baseFolderPath = getLogicFunctionBaseFolderPath(
+        flatLogicFunction.sourceHandlerPath,
+      );
+
+      await this.fileStorageService.uploadFolder_v2({
+        workspaceId,
+        applicationUniversalIdentifier,
+        fileFolder: FileFolder.Source,
+        resourcePath: baseFolderPath,
+        localPath: sourceTemporaryDir,
+      });
+    } finally {
+      await lambdaBuildDirectoryManager.clean();
+    }
+
+    // Build and upload the built function
+    await this.logicFunctionBuildService.buildAndUpload({
+      flatLogicFunction,
+      applicationUniversalIdentifier,
+    });
+
+    // Invalidate the workspace cache so changes are reflected
+    await this.flatEntityMapsCacheService.flushFlatEntityMaps({
+      workspaceId,
+      flatMapsKeys: ['flatLogicFunctionMaps'],
+    });
+
+    return { checksum, success: true };
+  }
+
+  private async writeSourcesToLocalFolder(
+    sources: Sources,
+    localPath: string,
+  ): Promise<void> {
+    for (const key of Object.keys(sources)) {
+      const filePath = join(localPath, key);
+      const value = sources[key];
+
+      if (isObject(value)) {
+        await this.writeSourcesToLocalFolder(value as Sources, filePath);
+        continue;
+      }
+      await fs.mkdir(dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, value);
+    }
   }
 }
